@@ -2,7 +2,7 @@
 
 ## Overview
 
-This agent is a CLI tool that connects to an LLM (Large Language Model) and returns structured JSON answers. It forms the foundation for the more advanced agent with tools and agentic loop that will be built in Tasks 2-3.
+This agent is a CLI tool that connects to an LLM (Large Language Model) with **tools** and an **agentic loop**. It can read wiki documentation files, discover available files, and provide answers with source citations. This forms the foundation for more advanced agents with additional tools.
 
 ## LLM Provider
 
@@ -13,7 +13,7 @@ This agent is a CLI tool that connects to an LLM (Large Language Model) and retu
 **Why Qwen Code:**
 - 1000 free requests per day (sufficient for development and testing)
 - Works from Russia without VPN
-- OpenAI-compatible API (easy integration)
+- OpenAI-compatible API with function calling support
 - Strong code understanding capabilities
 
 ## Architecture
@@ -23,7 +23,7 @@ This agent is a CLI tool that connects to an LLM (Large Language Model) and retu
 1. **CLI Entry Point (`agent.py`)**
    - Parses command-line arguments
    - Loads environment configuration
-   - Orchestrates the LLM call
+   - Runs the agentic loop
    - Outputs structured JSON
 
 2. **Environment Configuration (`.env.agent.secret`)**
@@ -32,10 +32,150 @@ This agent is a CLI tool that connects to an LLM (Large Language Model) and retu
 
 3. **LLM Client**
    - Uses `httpx` for HTTP requests
-   - Sends questions to the Qwen API
-   - Parses OpenAI-compatible responses
+   - Sends messages with tool schemas to the Qwen API
+   - Parses OpenAI-compatible responses with tool calls
 
-### Data Flow
+4. **Tools**
+   - `read_file`: Read a file from the project repository
+   - `list_files`: List files and directories at a given path
+
+5. **Agentic Loop**
+   - Manages multi-turn conversation with the LLM
+   - Executes tool calls and feeds results back
+   - Stops when LLM provides final answer or max calls reached
+
+### Tools
+
+#### `read_file`
+
+Reads a file from the project repository.
+
+**Parameters:**
+- `path` (string, required): Relative path from project root (e.g., `wiki/git-workflow.md`)
+
+**Returns:** File contents as a string, or error message.
+
+**Security:**
+- Rejects paths containing `..` (path traversal)
+- Rejects absolute paths
+- Only allows paths within project root
+
+#### `list_files`
+
+Lists files and directories at a given path.
+
+**Parameters:**
+- `path` (string, required): Relative directory path from project root (e.g., `wiki`)
+
+**Returns:** Newline-separated listing of entries, or error message.
+
+**Security:**
+- Same path security as `read_file`
+
+### Tool Schemas (Function Calling)
+
+Tools are registered with the LLM using OpenAI-compatible function schemas:
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "read_file",
+    "description": "Read a file from the project repository",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Relative path from project root"
+        }
+      },
+      "required": ["path"]
+    }
+  }
+}
+```
+
+The LLM uses these schemas to decide which tool to call and with what arguments.
+
+## Agentic Loop
+
+The agentic loop enables multi-turn reasoning with tool execution:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         Agentic Loop                            │
+│                                                                 │
+│  Question → LLM (with tools) → Response                         │
+│                               │                                 │
+│                   ┌───────────┴───────────┐                     │
+│                   │                       │                     │
+│            Has tool_calls?          No tool_calls               │
+│                   │                       │                     │
+│                 Yes                       │                     │
+│                   │                       │                     │
+│                   ▼                       │                     │
+│          Execute each tool                │                     │
+│                   │                       │                     │
+│                   ▼                       │                     │
+│          Append results as tool msgs      │                     │
+│                   │                       │                     │
+│                   ▼                       │                     │
+│          Loop back to LLM                 │                     │
+│          (max 10 calls)                   │                     │
+│                   │                       │                     │
+│                   └───────────────────────┘                     │
+│                                   │                             │
+│                                   ▼                             │
+│                          Extract answer + source                │
+│                                   │                             │
+│                                   ▼                             │
+│                          Output JSON and exit                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Loop Steps
+
+1. **Initialize** conversation with system prompt + user question
+2. **Call LLM** with tool schemas
+3. **Check response:**
+   - If `tool_calls` present:
+     - Execute each tool function
+     - Append tool results as `{"role": "tool", ...}` messages
+     - Increment tool call counter
+     - If counter >= 10, stop and get final answer
+     - Loop back to step 2
+   - If no `tool_calls`:
+     - Extract answer from `message.content`
+     - Extract source reference
+     - Output JSON and exit
+
+### System Prompt
+
+The system prompt instructs the LLM on how to use tools:
+
+```
+You are a documentation assistant for a software engineering toolkit project.
+You have access to a project wiki in the `wiki/` directory.
+
+Available tools:
+- list_files(path): List files and directories at a given path
+- read_file(path): Read the contents of a file
+
+When answering questions:
+1. Use list_files("wiki") to discover available documentation files
+2. Use read_file to read specific wiki files that may contain the answer
+3. Find the answer in the documentation and cite the source
+4. Include the source as "wiki/filename.md#section-anchor" format
+5. Once you have the answer, respond with the final answer (no more tool calls)
+
+Important:
+- Always include the source field in your final answer
+- Maximum 10 tool calls per question
+- If you cannot find the answer in the wiki, say so honestly
+```
+
+## Data Flow
 
 ```
 ┌─────────────┐     ┌──────────┐     ┌─────────────┐     ┌──────────┐
@@ -43,21 +183,35 @@ This agent is a CLI tool that connects to an LLM (Large Language Model) and retu
 │  Question   │     │   CLI    │     │  (on VM)    │     │  Model   │
 └─────────────┘     └──────────┘     └─────────────┘     └──────────┘
                          │                                      │
-                         │                                      │
                          │◀─────────────────────────────────────┘
-                         │          Answer Content
+                         │        Response with tool_calls
                          │
                          ▼
                   ┌─────────────┐
-                  │ JSON Output │
-                  │  {answer,   │
-                  │ tool_calls} │
+                  │ Execute     │
+                  │ Tools       │
+                  │ (read_file, │
+                  │ list_files) │
+                  └─────────────┘
+                         │
+                         │
+                         ▼
+                  ┌─────────────┐
+                  │ Feed results│
+                  │ back to LLM │
+                  └─────────────┘
+                         │
+                         │
+                         ▼
+                  ┌─────────────┐
+                  │ Final answer│
+                  │ with source │
                   └─────────────┘
 ```
 
-### Request/Response Format
+## Request/Response Format
 
-**Request to LLM API:**
+**Request to LLM API (with tools):**
 ```json
 POST {LLM_API_BASE}/chat/completions
 Headers:
@@ -67,15 +221,50 @@ Headers:
 Body:
 {
   "model": "qwen3-coder-plus",
-  "messages": [{"role": "user", "content": "<question>"}]
+  "messages": [
+    {"role": "system", "content": "..."},
+    {"role": "user", "content": "How do you resolve a merge conflict?"}
+  ],
+  "tools": [
+    {"type": "function", "function": {"name": "read_file", ...}},
+    {"type": "function", "function": {"name": "list_files", ...}}
+  ]
+}
+```
+
+**LLM Response (with tool calls):**
+```json
+{
+  "choices": [{
+    "message": {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "id": "call_abc123",
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"path\": \"wiki/git-workflow.md\"}"
+          }
+        }
+      ]
+    }
+  }]
 }
 ```
 
 **Response from agent.py:**
 ```json
 {
-  "answer": "<LLM's answer>",
-  "tool_calls": []
+  "answer": "Edit the conflicting file, choose which changes to keep, then stage and commit.",
+  "source": "wiki/git-workflow.md#resolving-merge-conflicts",
+  "tool_calls": [
+    {
+      "tool": "read_file",
+      "args": {"path": "wiki/git-workflow.md"},
+      "result": "..."
+    }
+  ]
 }
 ```
 
@@ -93,12 +282,16 @@ Body:
 ### Usage
 
 ```bash
-uv run agent.py "What does REST stand for?"
+uv run agent.py "How do you resolve a merge conflict?"
 ```
 
 **Output:**
 ```json
-{"answer": "Representational State Transfer.", "tool_calls": []}
+{
+  "answer": "Edit the conflicting file, choose which changes to keep, then stage and commit.",
+  "source": "wiki/git-workflow.md#resolving-merge-conflicts",
+  "tool_calls": [...]
+}
 ```
 
 ### Debug Output
@@ -121,38 +314,63 @@ The agent handles the following error cases:
 | HTTP error (4xx/5xx) | Exit with status code and response |
 | Network error | Exit with request error message |
 | Invalid API response | Exit with format error |
+| Path traversal attempt | Return error message from tool |
+| Max tool calls (10) | Stop loop, get final answer |
+
+## Security
+
+### Path Security
+
+Tools validate paths to prevent directory traversal:
+
+```python
+def is_safe_path(path: str) -> bool:
+    # Reject absolute paths
+    if path.startswith("/") or path.startswith("\\"):
+        return False
+    # Reject path traversal
+    if ".." in path:
+        return False
+    # Reject Windows drive letters
+    if len(path) > 1 and path[1] == ":":
+        return False
+    return True
+```
+
+This ensures tools can only access files within the project root.
 
 ## Testing
 
-Run the regression test:
+Run the regression tests:
 
 ```bash
-pytest tests/test_agent.py
+uv run pytest tests/test_agent.py -v
 ```
 
-The test verifies:
-- Agent produces valid JSON
-- `answer` field is present and non-empty
-- `tool_calls` field is present and is an array
-
-## Future Work (Tasks 2-3)
-
-In the next tasks, the agent will be extended with:
-
-1. **Tools** - Functions the agent can call (e.g., `read_file`, `query_api`)
-2. **Agentic Loop** - Multi-turn reasoning to decide when to use tools
-3. **Source Attribution** - Referencing files from the wiki
-4. **Enhanced System Prompt** - Domain knowledge about the LMS
+Tests verify:
+- Agent produces valid JSON with required fields
+- Tools are called when needed
+- Source field is populated
+- Path security works correctly
 
 ## File Structure
 
 ```
 .
-├── agent.py              # Main CLI entry point
+├── agent.py              # Main CLI entry point with agentic loop
 ├── .env.agent.secret     # LLM credentials (gitignored)
 ├── AGENT.md              # This documentation
 ├── plans/
-│   └── task-1.md         # Implementation plan
+│   ├── task-1.md         # Task 1 implementation plan
+│   └── task-2.md         # Task 2 implementation plan
 └── tests/
     └── test_agent.py     # Regression tests
 ```
+
+## Future Work (Task 3)
+
+In Task 3, the agent will be extended with:
+- Additional tools (e.g., `query_api` to query the backend)
+- Enhanced system prompt with domain knowledge
+- Better source extraction and citation
+- Improved error handling and recovery
