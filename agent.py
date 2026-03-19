@@ -406,10 +406,21 @@ async def call_llm(
         sys.exit(1)
 
     data = response.json()
-    try:
-        message = data["choices"][0]["message"]
-    except (KeyError, IndexError) as e:
-        print(f"Error: Unexpected API response format: {e}", file=sys.stderr)
+    
+    # Handle different API response formats
+    # Format 1: OpenAI standard with choices array
+    if "choices" in data:
+        try:
+            message = data["choices"][0]["message"]
+        except (KeyError, IndexError) as e:
+            print(f"Error: Unexpected API response format: {e}", file=sys.stderr)
+            print(f"Full response: {data}", file=sys.stderr)
+            sys.exit(1)
+    # Format 2: Direct message format (Qwen Code API)
+    elif "role" in data and "content" in data:
+        message = data
+    else:
+        print(f"Error: Unexpected API response format", file=sys.stderr)
         print(f"Full response: {data}", file=sys.stderr)
         sys.exit(1)
 
@@ -443,15 +454,8 @@ async def run_agentic_loop(question: str, config: dict[str, str]) -> dict:
 
     while tool_call_count < MAX_TOOL_CALLS:
         # Call LLM with tool schemas
-        response_data = await call_llm(messages, config, tools=tool_schemas)
-
-        # Extract the assistant message
-        try:
-            assistant_message = response_data["choices"][0]["message"]
-        except (KeyError, IndexError) as e:
-            print(f"Error: Unexpected API response format: {e}", file=sys.stderr)
-            print(f"Response: {response_data}", file=sys.stderr)
-            sys.exit(1)
+        # call_llm returns the message directly (already extracted from choices[0])
+        assistant_message = await call_llm(messages, config, tools=tool_schemas)
 
         # Check for tool calls
         tool_calls = assistant_message.get("tool_calls", [])
@@ -515,10 +519,9 @@ async def run_agentic_loop(question: str, config: dict[str, str]) -> dict:
         "content": "Maximum tool calls reached. Please provide your best answer based on the information gathered."
     })
 
-    response_data = await call_llm(messages, config, tools=None)
+    assistant_message = await call_llm(messages, config, tools=None)
 
     try:
-        assistant_message = response_data["choices"][0]["message"]
         answer = assistant_message.get("content") or ""
     except (KeyError, IndexError):
         answer = "Error: Could not get final answer from LLM."
