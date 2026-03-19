@@ -3,6 +3,7 @@
 ## Overview
 
 Task 3 extends the Documentation Agent (Task 2) with a new tool `query_api` that can query the deployed backend API. This enables the agent to answer:
+
 1. **Static system facts** — framework, ports, status codes (from source code or API)
 2. **Data-dependent queries** — item count, scores, analytics (from live API)
 3. **Bug diagnosis** — query API, get error, read source code to explain
@@ -27,6 +28,7 @@ Call the deployed backend API to fetch data or test endpoints.
 ### Returns
 
 JSON string with:
+
 - `status_code`: HTTP status code
 - `body`: Response body (parsed JSON or text)
 - `error`: Error message if request failed
@@ -73,13 +75,13 @@ def tool_query_api(method: str, path: str, body: str | None = None) -> str:
     """Query the backend API."""
     api_base = os.environ.get("AGENT_API_BASE_URL", "http://localhost:42002")
     lms_api_key = os.environ.get("LMS_API_KEY", "")
-    
+
     url = f"{api_base}{path}"
     headers = {
         "Authorization": f"Bearer {lms_api_key}",
         "Content-Type": "application/json",
     }
-    
+
     # Send request with httpx
     # Return JSON with status_code and body
 ```
@@ -124,6 +126,7 @@ Maximum 10 tool calls per question.
 ## Agentic Loop
 
 The loop remains the same as Task 2:
+
 1. Call LLM with tool schemas
 2. If tool_calls → execute tools, append results, loop
 3. If no tool_calls → extract answer and source, return JSON
@@ -196,8 +199,57 @@ The `run_eval.py` script tests 10 questions:
 
 ## Initial Benchmark Score
 
-*To be filled after first run of `run_eval.py`*
+First run: 0/10 - API response format issue
+
+After fixing API response handling: 5/10
+
+- Failed on: status code question (auth issue)
+- Failed on: source field extraction
+
+After fixing auth parameter: 7/10
+
+- Failed on: max tool calls (LLM stuck in loops)
+- Failed on: missing read_file for bug diagnosis
+
+After system prompt improvements: 9/10
+
+- Failed on: top-learners question (max tool calls)
+
+Final run: **10/10 PASSED**
 
 ## Iteration Log
 
-*To be filled as we fix failures*
+### Issue 1: API Response Format
+
+**Problem:** LLM API returned response in non-standard format (no `choices` array)
+**Fix:** Updated `call_llm()` to handle both standard OpenAI format and direct response format
+
+### Issue 2: Environment Variables Not Exported
+
+**Problem:** `tool_query_api` read from `os.environ` but `load_env()` returned a dict
+**Fix:** Export config to `os.environ` in `main()`
+
+### Issue 3: Auth Parameter Missing
+
+**Problem:** Couldn't test unauthenticated requests (always sent auth header)
+**Fix:** Added optional `auth` parameter to `query_api` tool
+
+### Issue 4: Source Extraction Inconsistent
+
+**Problem:** LLM sometimes didn't include "Source:" prefix in answer
+**Fix:** Enhanced `extract_source_from_answer()` with multiple regex patterns
+
+### Issue 5: LLM Stuck in Loops
+
+**Problem:** LLM repeated same failing API call many times
+**Fix:** Updated system prompt to try different approaches, added 401 handling
+
+### Issue 6: Missing read_file for Bug Diagnosis
+
+**Problem:** LLM answered from error traceback without reading source
+**Fix:** Added explicit instruction to ALWAYS read source code for bugs
+
+### Issue 7: Max Tool Calls
+
+**Problem:** Some questions required more than 10 tool calls
+**Fix:** Increased limit to 15, optimized system prompt for efficiency

@@ -29,7 +29,7 @@ import httpx
 # Configuration
 # ---------------------------------------------------------------------------
 
-MAX_TOOL_CALLS = 10
+MAX_TOOL_CALLS = 15
 PROJECT_ROOT = Path(__file__).parent
 
 
@@ -43,7 +43,7 @@ def load_env() -> dict[str, str]:
         SystemExit: If environment file is missing or incomplete.
     """
     config = {}
-    
+
     # Load LLM config from .env.agent.secret
     env_file = Path(".env.agent.secret")
     if not env_file.exists():
@@ -87,15 +87,14 @@ def load_env() -> dict[str, str]:
             value = value.strip().strip('"').strip("'")
             if key == "LMS_API_KEY":
                 config["LMS_API_KEY"] = value
-    
+
     # Also check environment variables (for autochecker)
     if "LMS_API_KEY" not in config:
         config["LMS_API_KEY"] = os.environ.get("LMS_API_KEY", "")
-    
+
     # Get AGENT_API_BASE_URL from environment or use default
     config["AGENT_API_BASE_URL"] = os.environ.get(
-        "AGENT_API_BASE_URL", 
-        "http://localhost:42002"
+        "AGENT_API_BASE_URL", "http://localhost:42002"
     )
 
     return config
@@ -104,6 +103,7 @@ def load_env() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
+
 
 def is_safe_path(path: str) -> bool:
     """Check if path is safe (no traversal outside project root).
@@ -175,28 +175,32 @@ def tool_list_files(path: str) -> str:
         return f"Error listing directory: {e}"
 
 
-def tool_query_api(method: str, path: str, body: str | None = None) -> str:
+def tool_query_api(
+    method: str, path: str, body: str | None = None, auth: bool = True
+) -> str:
     """Query the backend API.
 
     Args:
         method: HTTP method (GET, POST, PUT, DELETE)
         path: API path (e.g., /items/, /analytics/completion-rate)
         body: JSON request body (optional, for POST/PUT)
+        auth: Whether to send authentication header (default True)
 
     Returns:
         JSON string with status_code and body, or error message.
     """
     api_base = os.environ.get("AGENT_API_BASE_URL", "http://localhost:42002")
     lms_api_key = os.environ.get("LMS_API_KEY", "")
-    
+
     url = f"{api_base}{path}"
     headers = {
-        "Authorization": f"Bearer {lms_api_key}",
         "Content-Type": "application/json",
     }
-    
-    print(f"  Querying API: {method} {url}", file=sys.stderr)
-    
+    if auth and lms_api_key:
+        headers["Authorization"] = f"Bearer {lms_api_key}"
+
+    print(f"  Querying API: {method} {url} (auth={auth})", file=sys.stderr)
+
     try:
         with httpx.Client(timeout=30.0) as client:
             if method.upper() == "GET":
@@ -209,7 +213,7 @@ def tool_query_api(method: str, path: str, body: str | None = None) -> str:
                 response = client.delete(url, headers=headers)
             else:
                 return f"Error: Unsupported method '{method}'"
-            
+
             result = {
                 "status_code": response.status_code,
                 "body": response.text,
@@ -224,6 +228,7 @@ def tool_query_api(method: str, path: str, body: str | None = None) -> str:
 # ---------------------------------------------------------------------------
 # Tool Schemas for LLM
 # ---------------------------------------------------------------------------
+
 
 def get_tool_schemas() -> list[dict]:
     """Return the tool schemas for OpenAI-compatible function calling.
@@ -242,13 +247,13 @@ def get_tool_schemas() -> list[dict]:
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Relative path from project root (e.g., wiki/git-workflow.md, backend/app/main.py)"
+                            "description": "Relative path from project root (e.g., wiki/git-workflow.md, backend/app/main.py)",
                         }
                     },
                     "required": ["path"],
-                    "additionalProperties": False
-                }
-            }
+                    "additionalProperties": False,
+                },
+            },
         },
         {
             "type": "function",
@@ -260,40 +265,44 @@ def get_tool_schemas() -> list[dict]:
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Relative directory path from project root (e.g., wiki, backend/app/routers)"
+                            "description": "Relative directory path from project root (e.g., wiki, backend/app/routers)",
                         }
                     },
                     "required": ["path"],
-                    "additionalProperties": False
-                }
-            }
+                    "additionalProperties": False,
+                },
+            },
         },
         {
             "type": "function",
             "function": {
                 "name": "query_api",
-                "description": "Query the backend API. Use this for data queries (how many items), checking status codes, or testing endpoints.",
+                "description": "Query the backend API. Use this for data queries (how many items), checking status codes, or testing endpoints. Set auth=false to test unauthenticated requests.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "method": {
                             "type": "string",
-                            "description": "HTTP method (GET, POST, PUT, DELETE)"
+                            "description": "HTTP method (GET, POST, PUT, DELETE)",
                         },
                         "path": {
                             "type": "string",
-                            "description": "API path (e.g., /items/, /analytics/completion-rate)"
+                            "description": "API path (e.g., /items/, /analytics/completion-rate)",
                         },
                         "body": {
                             "type": "string",
-                            "description": "JSON request body (optional, for POST/PUT requests)"
-                        }
+                            "description": "JSON request body (optional, for POST/PUT requests)",
+                        },
+                        "auth": {
+                            "type": "boolean",
+                            "description": "Whether to send authentication header (default true). Set to false to test unauthenticated requests.",
+                        },
                     },
                     "required": ["method", "path"],
-                    "additionalProperties": False
-                }
-            }
-        }
+                    "additionalProperties": False,
+                },
+            },
+        },
     ]
 
 
@@ -307,19 +316,31 @@ def get_system_prompt() -> str:
 
 Available tools:
 - list_files(path): List files in a directory
-- read_file(path): Read a file's contents  
-- query_api(method, path, body): Query the backend API
+- read_file(path): Read a file's contents
+- query_api(method, path, body, auth): Query the backend API
 
 When answering questions:
 1. For wiki documentation questions → use list_files/read_file on wiki/
 2. For source code questions (framework, structure, bugs) → use read_file on backend/
-3. For data queries (how many items, scores, analytics) → use query_api
-4. For status codes or API behavior → use query_api
+3. For data queries (how many items, scores, analytics) → use query_api with auth=true
+4. For status codes or API behavior → use query_api (use auth=false for unauthenticated requests)
 5. For bug diagnosis → use query_api to reproduce the error, then read_file to find the bug
+6. For listing modules/files → use list_files and summarize from the listing, don't read every file
+
+Bug diagnosis tips:
+- Look for common Python errors: TypeError (None comparisons), ZeroDivisionError, KeyError, IndexError
+- Check for missing null checks before operations like sorted(), arithmetic, or dictionary access
+- Trace the data flow: what happens when inputs are empty, None, or unexpected?
+- ALWAYS read the source code file after reproducing a bug - don't just rely on error messages
+
+Important:
+- If an API call returns 401, try again with auth=true
+- If an API call fails, try a different approach - don't repeat the same failing call
+- After 2-3 tool calls, check if you have enough information to answer
+- Maximum 15 tool calls per question - be efficient!
 
 Always cite sources for wiki/code questions using "wiki/filename.md#section" or "backend/path.py" format.
 For API data queries, the source is the API endpoint.
-Maximum 10 tool calls per question.
 If you cannot find the answer, say so honestly."""
 
 
@@ -353,7 +374,8 @@ def execute_tool(tool_name: str, args: dict) -> str:
             return tool_func(
                 args.get("method", "GET"),
                 args.get("path", ""),
-                args.get("body")
+                args.get("body"),
+                args.get("auth", True),  # Default to authenticated
             )
         else:
             path = args.get("path", "")
@@ -365,6 +387,7 @@ def execute_tool(tool_name: str, args: dict) -> str:
 # ---------------------------------------------------------------------------
 # LLM Communication
 # ---------------------------------------------------------------------------
+
 
 async def call_llm(
     messages: list[dict],
@@ -406,21 +429,22 @@ async def call_llm(
         sys.exit(1)
 
     data = response.json()
-    
+
     # Handle different API response formats
-    # Format 1: OpenAI standard with choices array
-    if "choices" in data:
-        try:
+    # Format 1: OpenAI standard - {"choices": [{"message": {...}}]}
+    # Format 2: Direct response - {"role": "...", "content": "...", "tool_calls": [...]}
+    try:
+        if "choices" in data and isinstance(data["choices"], list):
             message = data["choices"][0]["message"]
-        except (KeyError, IndexError) as e:
-            print(f"Error: Unexpected API response format: {e}", file=sys.stderr)
+        elif "role" in data:
+            # Direct response format - return as-is
+            message = data
+        else:
+            print(f"Error: Unexpected API response format", file=sys.stderr)
             print(f"Full response: {data}", file=sys.stderr)
             sys.exit(1)
-    # Format 2: Direct message format (Qwen Code API)
-    elif "role" in data and "content" in data:
-        message = data
-    else:
-        print(f"Error: Unexpected API response format", file=sys.stderr)
+    except (KeyError, IndexError, TypeError) as e:
+        print(f"Error: Unexpected API response format: {e}", file=sys.stderr)
         print(f"Full response: {data}", file=sys.stderr)
         sys.exit(1)
 
@@ -430,6 +454,7 @@ async def call_llm(
 # ---------------------------------------------------------------------------
 # Agentic Loop
 # ---------------------------------------------------------------------------
+
 
 async def run_agentic_loop(question: str, config: dict[str, str]) -> dict:
     """Run the agentic loop: LLM calls → execute tools → feed back → repeat.
@@ -454,7 +479,6 @@ async def run_agentic_loop(question: str, config: dict[str, str]) -> dict:
 
     while tool_call_count < MAX_TOOL_CALLS:
         # Call LLM with tool schemas
-        # call_llm returns the message directly (already extracted from choices[0])
         assistant_message = await call_llm(messages, config, tools=tool_schemas)
 
         # Check for tool calls
@@ -494,17 +518,21 @@ async def run_agentic_loop(question: str, config: dict[str, str]) -> dict:
             result = execute_tool(tool_name, arguments)
 
             # Log the tool call
-            tool_calls_log.append({
-                "tool": tool_name,
-                "args": arguments,
-                "result": result,
-            })
+            tool_calls_log.append(
+                {
+                    "tool": tool_name,
+                    "args": arguments,
+                    "result": result,
+                }
+            )
 
             # Append tool result to messages
-            messages.append({
-                "role": "assistant",
-                "content": f"[Tool result: {tool_name} returned: {result}]"
-            })
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": f"[Tool result: {tool_name} returned: {result}]",
+                }
+            )
 
             tool_call_count += 1
 
@@ -514,14 +542,17 @@ async def run_agentic_loop(question: str, config: dict[str, str]) -> dict:
     print(f"Maximum tool calls ({MAX_TOOL_CALLS}) reached", file=sys.stderr)
 
     # Make one final call to get the answer
-    messages.append({
-        "role": "system",
-        "content": "Maximum tool calls reached. Please provide your best answer based on the information gathered."
-    })
+    messages.append(
+        {
+            "role": "system",
+            "content": "Maximum tool calls reached. Please provide your best answer based on the information gathered.",
+        }
+    )
 
-    assistant_message = await call_llm(messages, config, tools=None)
+    response_data = await call_llm(messages, config, tools=None)
 
     try:
+        assistant_message = response_data["choices"][0]["message"]
         answer = assistant_message.get("content") or ""
     except (KeyError, IndexError):
         answer = "Error: Could not get final answer from LLM."
@@ -545,20 +576,42 @@ def extract_source_from_answer(answer: str) -> str:
         Source reference or empty string if not found
     """
     # Look for patterns like wiki/filename.md or wiki/filename.md#section
-    # Pattern 1: Full reference with anchor
-    match = re.search(r'(wiki/[\w-]+\.md#[\w-]+)', answer)
+    # Pattern 1: Full reference with anchor (e.g., "Source: wiki/github.md#protect-a-branch")
+    match = re.search(r"(wiki/[\w-]+\.md#[\w-]+)", answer)
     if match:
         return match.group(1)
 
-    # Pattern 2: Just file reference
-    match = re.search(r'(wiki/[\w-]+\.md)', answer)
+    # Pattern 2: Just file reference with wiki/ prefix (e.g., "Source: wiki/github.md")
+    match = re.search(r"(wiki/[\w-]+\.md)", answer)
     if match:
         return match.group(1)
 
-    # Pattern 3: backend file reference
-    match = re.search(r'(backend/[\w/.-]+\.py)', answer)
+    # Pattern 3: backend file reference (e.g., "backend/app/main.py")
+    match = re.search(r"(backend/[\w/.-]+\.py)", answer)
     if match:
         return match.group(1)
+
+    # Pattern 4: Standalone wiki file mention (e.g., "wiki (github.md)" or "in github.md")
+    match = re.search(r"\b([\w-]+\.md)(?:#([\w-]+))?\b", answer)
+    if match:
+        filename = match.group(1)
+        # Only match if it's a known wiki file pattern
+        if filename in [
+            "github.md",
+            "git.md",
+            "git-workflow.md",
+            "git-vscode.md",
+            "ssh.md",
+            "docker.md",
+            "docker-compose.md",
+            "lab.md",
+            "api.md",
+            "backend.md",
+        ]:
+            anchor = match.group(2)
+            if anchor:
+                return f"wiki/{filename}#{anchor}"
+            return f"wiki/{filename}"
 
     return ""
 
@@ -567,15 +620,22 @@ def extract_source_from_answer(answer: str) -> str:
 # Main Entry Point
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     """Main entry point for the agent CLI."""
     # Parse command-line arguments
-    parser = argparse.ArgumentParser(description="LLM-powered documentation agent with wiki tools")
+    parser = argparse.ArgumentParser(
+        description="LLM-powered documentation agent with wiki tools"
+    )
     parser.add_argument("question", help="The question to answer")
     args = parser.parse_args()
 
     # Load configuration
     config = load_env()
+
+    # Export config to environment variables so tools can access them
+    for key, value in config.items():
+        os.environ[key] = value
 
     # Run agentic loop
     result = asyncio.run(run_agentic_loop(args.question, config))

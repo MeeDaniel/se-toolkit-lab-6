@@ -19,6 +19,7 @@ This agent is a CLI tool that connects to an LLM (Large Language Model) with **t
 **Model:** `qwen3-coder-plus`
 
 **Why Qwen Code:**
+
 - 1000 free requests per day (sufficient for development and testing)
 - Works from Russia without VPN
 - OpenAI-compatible API with function calling support
@@ -59,11 +60,13 @@ This agent is a CLI tool that connects to an LLM (Large Language Model) with **t
 Reads a file from the project repository.
 
 **Parameters:**
+
 - `path` (string, required): Relative path from project root (e.g., `wiki/git-workflow.md`)
 
 **Returns:** File contents as a string, or error message.
 
 **Security:**
+
 - Rejects paths containing `..` (path traversal)
 - Rejects absolute paths
 - Only allows paths within project root
@@ -73,11 +76,13 @@ Reads a file from the project repository.
 Lists files and directories at a given path.
 
 **Parameters:**
+
 - `path` (string, required): Relative directory path from project root (e.g., `wiki`)
 
 **Returns:** Newline-separated listing of entries, or error message.
 
 **Security:**
+
 - Same path security as `read_file`
 
 ### Tool Schemas (Function Calling)
@@ -220,6 +225,7 @@ Important:
 ## Request/Response Format
 
 **Request to LLM API (with tools):**
+
 ```json
 POST {LLM_API_BASE}/chat/completions
 Headers:
@@ -241,6 +247,7 @@ Body:
 ```
 
 **LLM Response (with tool calls):**
+
 ```json
 {
   "choices": [{
@@ -262,6 +269,7 @@ Body:
 ```
 
 **Response from agent.py:**
+
 ```json
 {
   "answer": "Edit the conflicting file, choose which changes to keep, then stage and commit.",
@@ -282,6 +290,7 @@ Body:
 
 1. Set up Qwen Code API on your VM (see `wiki/qwen.md`)
 2. Create `.env.agent.secret` with your credentials:
+
    ```bash
    cp .env.agent.example .env.agent.secret
    # Edit with your VM IP, port, and API key
@@ -294,6 +303,7 @@ uv run agent.py "How do you resolve a merge conflict?"
 ```
 
 **Output:**
+
 ```json
 {
   "answer": "Edit the conflicting file, choose which changes to keep, then stage and commit.",
@@ -356,6 +366,7 @@ uv run pytest tests/test_agent.py -v
 ```
 
 Tests verify:
+
 - Agent produces valid JSON with required fields
 - Tools are called when needed
 - Source field is populated
@@ -378,7 +389,136 @@ Tests verify:
 ## Future Work (Task 3)
 
 In Task 3, the agent will be extended with:
+
 - Additional tools (e.g., `query_api` to query the backend)
 - Enhanced system prompt with domain knowledge
 - Better source extraction and citation
 - Improved error handling and recovery
+
+---
+
+## Task 3: The System Agent (COMPLETED)
+
+### New Tool: `query_api`
+
+The `query_api` tool enables the agent to query the deployed backend API for data-dependent questions.
+
+**Parameters:**
+
+- `method` (string, required): HTTP method (GET, POST, PUT, DELETE)
+- `path` (string, required): API path (e.g., `/items/`, `/analytics/completion-rate`)
+- `body` (string, optional): JSON request body for POST/PUT requests
+- `auth` (boolean, optional, default=True): Whether to send authentication header
+
+**Returns:** JSON string with `status_code` and `body`, or error message.
+
+**Authentication:** Uses `LMS_API_KEY` from `.env.docker.secret` for `Authorization: Bearer` header. Set `auth=false` to test unauthenticated requests.
+
+**Example usage:**
+
+```bash
+uv run agent.py "How many items are in the database?"
+```
+
+```json
+{
+  "answer": "There are 120 items in the database.",
+  "source": "",
+  "tool_calls": [
+    {
+      "tool": "query_api",
+      "args": {"method": "GET", "path": "/items/"},
+      "result": "{\"status_code\": 200, \"body\": \"[...]}"
+    }
+  ]
+}
+```
+
+### Environment Variables
+
+The agent reads all configuration from environment variables:
+
+| Variable | Purpose | Source |
+|----------|---------|--------|
+| `LLM_API_KEY` | LLM provider API key | `.env.agent.secret` |
+| `LLM_API_BASE` | LLM API endpoint URL | `.env.agent.secret` |
+| `LLM_MODEL` | Model name | `.env.agent.secret` |
+| `LMS_API_KEY` | Backend API key for query_api | `.env.docker.secret` |
+| `AGENT_API_BASE_URL` | Base URL for query_api (default: `http://localhost:42002`) | Optional, env var |
+
+**Important:** The autochecker injects different values at evaluation time. Never hardcode these values.
+
+### Updated System Prompt
+
+The system prompt guides the LLM to choose the right tool:
+
+1. **Wiki documentation questions** → `list_files`/`read_file` on `wiki/`
+2. **Source code questions** → `read_file` on `backend/`
+3. **Data queries** → `query_api` with `auth=true`
+4. **Status code testing** → `query_api` with `auth=false`
+5. **Bug diagnosis** → `query_api` to reproduce, then `read_file` to find the bug
+
+The prompt also includes bug diagnosis tips:
+
+- Look for common Python errors: TypeError, ZeroDivisionError, KeyError, IndexError
+- Check for missing null checks before sorted(), arithmetic, or dictionary access
+- ALWAYS read the source code after reproducing a bug
+
+### Source Extraction
+
+The `extract_source_from_answer()` function uses multiple regex patterns to extract source references:
+
+1. `wiki/filename.md#anchor` - Full reference with anchor
+2. `wiki/filename.md` - Wiki file with prefix
+3. `backend/path/file.py` - Backend file reference
+4. Standalone wiki file mentions (e.g., "github.md") - Maps to `wiki/github.md`
+
+### Lessons Learned
+
+1. **API Response Format Variations:** The LLM API may return responses in different formats. Handle both standard OpenAI format (`choices[0].message`) and direct response format.
+
+2. **Environment Variable Export:** Configuration loaded from files must be exported to `os.environ` for tools to access them.
+
+3. **Flexible Authentication:** The `query_api` tool needs an optional `auth` parameter to test both authenticated and unauthenticated requests.  
+
+4. **Non-deterministic LLM Responses:** The same question may get different responses. Improve system prompts to guide consistent behavior.
+
+5. **Preventing Infinite Loops:** LLMs can get stuck repeating the same failing action. Add explicit instructions to try different approaches after failures.
+
+6. **Tool Call Limits:** Some questions require more than 10 tool calls. Increased limit to 15 and optimized prompts for efficiency.
+
+7. **Source Citation:** LLMs don't always cite sources in the expected format. Use flexible regex patterns to extract various citation styles.
+
+### Benchmark Results
+
+**Final Score: 10/10 PASSED**
+
+| # | Question | Tool(s) Required | Status |
+|---|----------|------------------|--------|
+| 0 | Protect branch steps (wiki) | read_file | ✓ |
+| 1 | SSH connection steps (wiki) | read_file | ✓ |
+| 2 | Python web framework | read_file | ✓ |
+| 3 | API router modules | list_files | ✓ |
+| 4 | Items in database | query_api | ✓ |
+| 5 | Status code without auth | query_api | ✓ |
+| 6 | Completion-rate error | query_api, read_file | ✓ |
+| 7 | Top-learners error | query_api, read_file | ✓ |
+| 8 | Request lifecycle (LLM judge) | read_file | ✓ |
+| 9 | ETL idempotency (LLM judge) | read_file | ✓ |
+
+### File Structure (Updated)
+
+```
+.
+├── agent.py              # Main CLI with agentic loop and 3 tools
+├── .env.agent.secret     # LLM credentials (gitignored)
+├── .env.docker.secret    # Backend API key (gitignored)
+├── AGENT.md              # This documentation
+├── plans/
+│   ├── task-1.md         # Task 1 implementation plan
+│   ├── task-2.md         # Task 2 implementation plan
+│   └── task-3.md         # Task 3 implementation plan
+└── tests/
+    └── test_agent.py     # Regression tests
+```
+cat 
