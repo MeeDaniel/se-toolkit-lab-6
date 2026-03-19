@@ -2,20 +2,23 @@
 """Agent CLI - Calls an LLM with tools and returns a structured JSON answer.
 
 Usage:
-    uv run agent.py "How do you resolve a merge conflict?"
+    uv run agent.py "How many items are in the database?"
 
 Output:
     {
       "answer": "...",
-      "source": "wiki/git-workflow.md#resolving-merge-conflicts",
+      "source": "...",
       "tool_calls": [...]
     }
 
 All debug output goes to stderr. Only valid JSON goes to stdout.
 """
 
+import argparse
+import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -31,14 +34,17 @@ PROJECT_ROOT = Path(__file__).parent
 
 
 def load_env() -> dict[str, str]:
-    """Load LLM configuration from .env.agent.secret.
+    """Load LLM and LMS configuration from environment files.
 
     Returns:
-        Dictionary with LLM_API_KEY, LLM_API_BASE, LLM_MODEL
+        Dictionary with LLM_API_KEY, LLM_API_BASE, LLM_MODEL, LMS_API_KEY, AGENT_API_BASE_URL
 
     Raises:
         SystemExit: If environment file is missing or incomplete.
     """
+    config = {}
+    
+    # Load LLM config from .env.agent.secret
     env_file = Path(".env.agent.secret")
     if not env_file.exists():
         print(f"Error: {env_file} not found", file=sys.stderr)
@@ -48,8 +54,7 @@ def load_env() -> dict[str, str]:
         )
         sys.exit(1)
 
-    config = {}
-    required_keys = ["LLM_API_KEY", "LLM_API_BASE", "LLM_MODEL"]
+    required_llm_keys = ["LLM_API_KEY", "LLM_API_BASE", "LLM_MODEL"]
 
     for line in env_file.read_text().splitlines():
         line = line.strip()
@@ -60,13 +65,38 @@ def load_env() -> dict[str, str]:
         key, _, value = line.partition("=")
         key = key.strip()
         value = value.strip().strip('"').strip("'")
-        if key in required_keys:
+        if key in required_llm_keys:
             config[key] = value
 
-    missing = [k for k in required_keys if k not in config]
+    missing = [k for k in required_llm_keys if k not in config]
     if missing:
-        print(f"Error: Missing configuration keys: {missing}", file=sys.stderr)
+        print(f"Error: Missing LLM configuration keys: {missing}", file=sys.stderr)
         sys.exit(1)
+
+    # Load LMS API key from .env.docker.secret
+    lms_env_file = Path(".env.docker.secret")
+    if lms_env_file.exists():
+        for line in lms_env_file.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key == "LMS_API_KEY":
+                config["LMS_API_KEY"] = value
+    
+    # Also check environment variables (for autochecker)
+    if "LMS_API_KEY" not in config:
+        config["LMS_API_KEY"] = os.environ.get("LMS_API_KEY", "")
+    
+    # Get AGENT_API_BASE_URL from environment or use default
+    config["AGENT_API_BASE_URL"] = os.environ.get(
+        "AGENT_API_BASE_URL", 
+        "http://localhost:42002"
+    )
 
     return config
 
@@ -145,6 +175,52 @@ def tool_list_files(path: str) -> str:
         return f"Error listing directory: {e}"
 
 
+def tool_query_api(method: str, path: str, body: str | None = None) -> str:
+    """Query the backend API.
+
+    Args:
+        method: HTTP method (GET, POST, PUT, DELETE)
+        path: API path (e.g., /items/, /analytics/completion-rate)
+        body: JSON request body (optional, for POST/PUT)
+
+    Returns:
+        JSON string with status_code and body, or error message.
+    """
+    api_base = os.environ.get("AGENT_API_BASE_URL", "http://localhost:42002")
+    lms_api_key = os.environ.get("LMS_API_KEY", "")
+    
+    url = f"{api_base}{path}"
+    headers = {
+        "Authorization": f"Bearer {lms_api_key}",
+        "Content-Type": "application/json",
+    }
+    
+    print(f"  Querying API: {method} {url}", file=sys.stderr)
+    
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            if method.upper() == "GET":
+                response = client.get(url, headers=headers)
+            elif method.upper() == "POST":
+                response = client.post(url, headers=headers, content=body or "{}")
+            elif method.upper() == "PUT":
+                response = client.put(url, headers=headers, content=body or "{}")
+            elif method.upper() == "DELETE":
+                response = client.delete(url, headers=headers)
+            else:
+                return f"Error: Unsupported method '{method}'"
+            
+            result = {
+                "status_code": response.status_code,
+                "body": response.text,
+            }
+            return json.dumps(result)
+    except httpx.TimeoutException:
+        return json.dumps({"error": "API request timed out"})
+    except httpx.RequestError as e:
+        return json.dumps({"error": f"Request failed: {e}"})
+
+
 # ---------------------------------------------------------------------------
 # Tool Schemas for LLM
 # ---------------------------------------------------------------------------
@@ -160,13 +236,13 @@ def get_tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read a file from the project repository. Use this to read wiki documentation files.",
+                "description": "Read a file from the project repository. Use this to read wiki documentation or source code files.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Relative path from project root (e.g., wiki/git-workflow.md)"
+                            "description": "Relative path from project root (e.g., wiki/git-workflow.md, backend/app/main.py)"
                         }
                     },
                     "required": ["path"],
@@ -178,16 +254,42 @@ def get_tool_schemas() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "list_files",
-                "description": "List files and directories at a given path. Use this to discover available wiki files.",
+                "description": "List files and directories at a given path. Use this to discover available files.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Relative directory path from project root (e.g., wiki)"
+                            "description": "Relative directory path from project root (e.g., wiki, backend/app/routers)"
                         }
                     },
                     "required": ["path"],
+                    "additionalProperties": False
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "query_api",
+                "description": "Query the backend API. Use this for data queries (how many items), checking status codes, or testing endpoints.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "method": {
+                            "type": "string",
+                            "description": "HTTP method (GET, POST, PUT, DELETE)"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "API path (e.g., /items/, /analytics/completion-rate)"
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": "JSON request body (optional, for POST/PUT requests)"
+                        }
+                    },
+                    "required": ["method", "path"],
                     "additionalProperties": False
                 }
             }
@@ -196,29 +298,29 @@ def get_tool_schemas() -> list[dict]:
 
 
 def get_system_prompt() -> str:
-    """Return the system prompt for the documentation agent.
+    """Return the system prompt for the system agent.
 
     Returns:
         System prompt string
     """
-    return """You are a documentation assistant for a software engineering toolkit project.
-You have access to a project wiki in the `wiki/` directory.
+    return """You are a documentation and system assistant for a software engineering toolkit project.
 
 Available tools:
-- list_files(path): List files and directories at a given path
-- read_file(path): Read the contents of a file
+- list_files(path): List files in a directory
+- read_file(path): Read a file's contents  
+- query_api(method, path, body): Query the backend API
 
 When answering questions:
-1. Use list_files("wiki") to discover available documentation files
-2. Use read_file to read specific wiki files that may contain the answer
-3. Find the answer in the documentation and cite the source
-4. Include the source as "wiki/filename.md#section-anchor" format
-5. Once you have the answer, respond with the final answer (no more tool calls)
+1. For wiki documentation questions → use list_files/read_file on wiki/
+2. For source code questions (framework, structure, bugs) → use read_file on backend/
+3. For data queries (how many items, scores, analytics) → use query_api
+4. For status codes or API behavior → use query_api
+5. For bug diagnosis → use query_api to reproduce the error, then read_file to find the bug
 
-Important:
-- Always include the source field in your final answer
-- Maximum 10 tool calls per question
-- If you cannot find the answer in the wiki, say so honestly"""
+Always cite sources for wiki/code questions using "wiki/filename.md#section" or "backend/path.py" format.
+For API data queries, the source is the API endpoint.
+Maximum 10 tool calls per question.
+If you cannot find the answer, say so honestly."""
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +330,7 @@ Important:
 TOOLS = {
     "read_file": tool_read_file,
     "list_files": tool_list_files,
+    "query_api": tool_query_api,
 }
 
 
@@ -246,9 +349,15 @@ def execute_tool(tool_name: str, args: dict) -> str:
 
     tool_func = TOOLS[tool_name]
     try:
-        # Extract the path argument
-        path = args.get("path", "")
-        return tool_func(path)
+        if tool_name == "query_api":
+            return tool_func(
+                args.get("method", "GET"),
+                args.get("path", ""),
+                args.get("body")
+            )
+        else:
+            path = args.get("path", "")
+            return tool_func(path)
     except Exception as e:
         return f"Error executing {tool_name}: {e}"
 
@@ -257,19 +366,20 @@ def execute_tool(tool_name: str, args: dict) -> str:
 # LLM Communication
 # ---------------------------------------------------------------------------
 
-def call_llm(messages: list[dict], config: dict[str, str], tools: list[dict] | None = None) -> dict:
-    """Send messages to the LLM and return the response.
+async def call_llm(
+    messages: list[dict],
+    config: dict[str, str],
+    tools: list[dict] | None = None,
+) -> dict:
+    """Call the LLM API and return the response.
 
     Args:
         messages: List of conversation messages
         config: LLM configuration
-        tools: Optional list of tool schemas
+        tools: Optional tool definitions for function calling
 
     Returns:
-        Parsed LLM response dictionary
-
-    Raises:
-        SystemExit: If the API request fails.
+        Parsed response dict with message and tool_calls
     """
     api_base = config["LLM_API_BASE"]
     api_key = config["LLM_API_KEY"]
@@ -277,43 +387,40 @@ def call_llm(messages: list[dict], config: dict[str, str], tools: list[dict] | N
 
     url = f"{api_base}/chat/completions"
     headers = {
-        "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
     }
-
     payload: dict = {
         "model": model,
         "messages": messages,
     }
-
     if tools:
         payload["tools"] = tools
 
-    print(f"Calling LLM at {url}...", file=sys.stderr)
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(url, headers=headers, json=payload)
 
+    if response.status_code != 200:
+        print(f"Error: API returned status {response.status_code}", file=sys.stderr)
+        print(f"Response: {response.text[:200]}", file=sys.stderr)
+        sys.exit(1)
+
+    data = response.json()
     try:
-        with httpx.Client(timeout=60.0) as client:
-            response = client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            data = response.json()
-    except httpx.TimeoutException:
-        print("Error: LLM request timed out", file=sys.stderr)
-        sys.exit(1)
-    except httpx.HTTPStatusError as e:
-        print(f"Error: HTTP {e.response.status_code}: {e.response.text[:200]}", file=sys.stderr)
-        sys.exit(1)
-    except httpx.RequestError as e:
-        print(f"Error: Request failed: {e}", file=sys.stderr)
+        message = data["choices"][0]["message"]
+    except (KeyError, IndexError) as e:
+        print(f"Error: Unexpected API response format: {e}", file=sys.stderr)
+        print(f"Full response: {data}", file=sys.stderr)
         sys.exit(1)
 
-    return data
+    return message
 
 
 # ---------------------------------------------------------------------------
 # Agentic Loop
 # ---------------------------------------------------------------------------
 
-def run_agentic_loop(question: str, config: dict[str, str]) -> dict:
+async def run_agentic_loop(question: str, config: dict[str, str]) -> dict:
     """Run the agentic loop: LLM calls → execute tools → feed back → repeat.
 
     Args:
@@ -336,7 +443,7 @@ def run_agentic_loop(question: str, config: dict[str, str]) -> dict:
 
     while tool_call_count < MAX_TOOL_CALLS:
         # Call LLM with tool schemas
-        response_data = call_llm(messages, config, tools=tool_schemas)
+        response_data = await call_llm(messages, config, tools=tool_schemas)
 
         # Extract the assistant message
         try:
@@ -351,11 +458,10 @@ def run_agentic_loop(question: str, config: dict[str, str]) -> dict:
 
         if not tool_calls:
             # No tool calls - LLM provided final answer
-            answer = assistant_message.get("content", "")
+            answer = assistant_message.get("content") or ""
             print(f"LLM provided final answer: {answer[:100]}...", file=sys.stderr)
 
             # Extract source from answer (LLM should mention it)
-            # For now, we'll try to parse it from the answer or use a default
             source = extract_source_from_answer(answer)
 
             return {
@@ -391,7 +497,6 @@ def run_agentic_loop(question: str, config: dict[str, str]) -> dict:
             })
 
             # Append tool result to messages
-            # Use assistant role with tool output reference for better compatibility
             messages.append({
                 "role": "assistant",
                 "content": f"[Tool result: {tool_name} returned: {result}]"
@@ -410,11 +515,11 @@ def run_agentic_loop(question: str, config: dict[str, str]) -> dict:
         "content": "Maximum tool calls reached. Please provide your best answer based on the information gathered."
     })
 
-    response_data = call_llm(messages, config, tools=None)
+    response_data = await call_llm(messages, config, tools=None)
 
     try:
         assistant_message = response_data["choices"][0]["message"]
-        answer = assistant_message.get("content", "")
+        answer = assistant_message.get("content") or ""
     except (KeyError, IndexError):
         answer = "Error: Could not get final answer from LLM."
 
@@ -437,8 +542,6 @@ def extract_source_from_answer(answer: str) -> str:
         Source reference or empty string if not found
     """
     # Look for patterns like wiki/filename.md or wiki/filename.md#section
-    import re
-
     # Pattern 1: Full reference with anchor
     match = re.search(r'(wiki/[\w-]+\.md#[\w-]+)', answer)
     if match:
@@ -446,6 +549,11 @@ def extract_source_from_answer(answer: str) -> str:
 
     # Pattern 2: Just file reference
     match = re.search(r'(wiki/[\w-]+\.md)', answer)
+    if match:
+        return match.group(1)
+
+    # Pattern 3: backend file reference
+    match = re.search(r'(backend/[\w/.-]+\.py)', answer)
     if match:
         return match.group(1)
 
@@ -459,17 +567,15 @@ def extract_source_from_answer(answer: str) -> str:
 def main() -> None:
     """Main entry point for the agent CLI."""
     # Parse command-line arguments
-    if len(sys.argv) < 2:
-        print("Usage: uv run agent.py <question>", file=sys.stderr)
-        sys.exit(1)
-
-    question = sys.argv[1]
+    parser = argparse.ArgumentParser(description="LLM-powered documentation agent with wiki tools")
+    parser.add_argument("question", help="The question to answer")
+    args = parser.parse_args()
 
     # Load configuration
     config = load_env()
 
     # Run agentic loop
-    result = run_agentic_loop(question, config)
+    result = asyncio.run(run_agentic_loop(args.question, config))
 
     # Output structured JSON to stdout
     print(json.dumps(result))

@@ -2,7 +2,15 @@
 
 ## Overview
 
-This agent is a CLI tool that connects to an LLM (Large Language Model) with **tools** and an **agentic loop**. It can read wiki documentation files, discover available files, and provide answers with source citations. This forms the foundation for more advanced agents with additional tools.
+This agent is a CLI tool that connects to an LLM (Large Language Model) with **tools** and an **agentic loop**. It can read wiki documentation files, discover available files, query the backend API for data, and provide answers with source citations. The agent is designed to answer questions about project documentation, system behavior, and data stored in the backend.
+
+## Key Features
+
+- **Multi-turn reasoning**: The agentic loop allows the LLM to make multiple tool calls in sequence, refining its approach based on intermediate results
+- **Tool-based architecture**: All external interactions happen through well-defined tools with clear schemas
+- **Secure file access**: Path validation prevents directory traversal attacks
+- **Backend API integration**: The `query_api` tool enables data queries and system behavior testing
+- **Source citation**: Answers include references to wiki files or API endpoints
 
 ## LLM Provider
 
