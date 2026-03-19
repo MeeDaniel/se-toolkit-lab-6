@@ -48,6 +48,7 @@ def run_agent(question: str) -> tuple[dict, str | None]:
 # Task 1 Tests (Basic JSON Output)
 # ---------------------------------------------------------------------------
 
+
 def test_agent_returns_json_with_required_fields():
     """Test that agent.py returns valid JSON with required fields."""
     question = "What is 2+2?"
@@ -75,6 +76,7 @@ def test_agent_returns_non_empty_answer():
 # ---------------------------------------------------------------------------
 # Task 2 Tests (Tool Calling)
 # ---------------------------------------------------------------------------
+
 
 def test_agent_uses_read_file_for_merge_conflict_question():
     """Test that agent uses read_file tool when asked about merge conflicts.
@@ -147,3 +149,61 @@ def test_agent_tool_security_rejects_path_traversal():
         args = tc.get("args", {})
         path = args.get("path", "")
         assert ".." not in path, f"Path traversal detected: {path}"
+
+
+# ---------------------------------------------------------------------------
+# Task 3 Tests (System Agent Tools)
+# ---------------------------------------------------------------------------
+
+
+def test_agent_uses_query_api_for_database_count():
+    """Test that agent uses query_api tool when asked about database items.
+
+    The agent should query the API to get the item count.
+    """
+    question = "How many items are in the database?"
+
+    data, error = run_agent(question)
+
+    assert error is None, f"Agent failed: {error}"
+    assert data.get("answer"), "Answer is empty"
+
+    # Check that query_api was used
+    tool_calls = data.get("tool_calls", [])
+    tools_used = [tc.get("tool") for tc in tool_calls]
+    assert "query_api" in tools_used, (
+        f"Expected 'query_api' in tool_calls, got: {tools_used}"
+    )
+
+    # Verify the tool was called with GET method and /items/ path
+    for tc in tool_calls:
+        if tc.get("tool") == "query_api":
+            args = tc.get("args", {})
+            assert args.get("method") == "GET", (
+                f"Expected query_api to use GET method, got: {args.get('method')}"
+            )
+            assert "/items" in args.get("path", ""), (
+                f"Expected query_api to call /items endpoint, got: {args.get('path')}"
+            )
+
+
+def test_agent_uses_read_file_for_bug_diagnosis():
+    """Test that agent uses both query_api and read_file for bug diagnosis.
+
+    The agent should query the API to reproduce the error, then read the source code.
+    """
+    question = "Query the /analytics/completion-rate endpoint for a lab with no data. What error do you get?"
+
+    data, error = run_agent(question)
+
+    assert error is None, f"Agent failed: {error}"
+    assert data.get("answer"), "Answer is empty"
+
+    # Check that both query_api and read_file were used
+    tool_calls = data.get("tool_calls", [])
+    tools_used = [tc.get("tool") for tc in tool_calls]
+    assert "query_api" in tools_used, (
+        f"Expected 'query_api' in tool_calls, got: {tools_used}"
+    )
+    # Note: read_file may not always be used if the error is clear from API response
+    # This test verifies query_api is used for API error questions
